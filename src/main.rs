@@ -2,6 +2,7 @@ mod analyst;
 mod database;
 mod governor;
 mod notifier;
+mod recharger;
 mod scanner;
 mod strategy;
 mod trader;
@@ -19,6 +20,7 @@ use crate::governor::Governor;
 use crate::notifier::Notifier;
 use crate::scanner::Scanner;
 use crate::strategy::Strategy;
+use crate::recharger::Recharger;
 use crate::trader::Trader;
 
 fn env_f64(key: &str, default: f64) -> f64 {
@@ -45,7 +47,12 @@ fn order_succeeded(resp: &crate::trader::OrderResponse) -> bool {
         .as_deref()
         .map(|s| s.eq_ignore_ascii_case("FAILED"))
         .unwrap_or(false);
-    !failed_status && resp.error.is_none()
+    let has_real_error = resp
+        .error
+        .as_deref()
+        .map(|e| !e.trim().is_empty())
+        .unwrap_or(false);
+    !failed_status && !has_real_error
 }
 
 fn is_yes_label(label: &str) -> bool {
@@ -104,14 +111,13 @@ fn build_market_state(market: &crate::scanner::CleanMarket) -> String {
     )
 }
 
-fn build_position_state(
+fn build_market_state_for_position(
     outcome_label: &str,
     entry_price: f64,
     current_price: f64,
     pnl_pct: f64,
     entry_probability: Option<f64>,
     entry_edge: Option<f64>,
-    strategy_note: Option<&str>,
 ) -> String {
     let entry_prob = entry_probability
         .map(|v| format!("{:.4}", v))
@@ -119,20 +125,14 @@ fn build_position_state(
     let entry_edge = entry_edge
         .map(|v| format!("{:+.4}", v))
         .unwrap_or_else(|| "NA".to_string());
-    let note_short = strategy_note
-        .unwrap_or("NA")
-        .chars()
-        .take(80)
-        .collect::<String>();
     format!(
-        "held={};entry={:.4};now={:.4};pnl={:+.2}%;entry_q={};entry_edge={};note={}",
+        "held={};entry={:.4};now={:.4};pnl={:+.2}%;entry_q={};entry_edge={}",
         outcome_label,
         entry_price,
         current_price,
         pnl_pct * 100.0,
         entry_prob,
         entry_edge,
-        note_short
     )
 }
 
@@ -152,41 +152,30 @@ async fn main() -> Result<()> {
     // 1. Initialize Modules
     let mut governor = Governor::new(0.0, wallet_address, proxy_address);
     let notifier = Notifier::new();
-    let strategy = Strategy::new(0.08, 0.06); // min_edge 8%, max_bet 6%
+    let max_bet_frac = env_f64("MAX_BET_FRACTION", 0.10).clamp(0.02, 0.25);
+    let strategy = Strategy::new(0.08, max_bet_frac); // min_edge 8%, max_bet 10%
     let trade_cycle_secs = env_u64("TRADE_CYCLE_SECONDS", 600).max(30);
     let position_check_secs = env_u64("POSITION_CHECK_SECONDS", 60).max(10);
     let report_interval_secs = env_u64("REPORT_INTERVAL_SECONDS", 14400).max(300);
     let low_balance_wait_secs = env_u64("LOW_BALANCE_WAIT_SECONDS", trade_cycle_secs).max(30);
-    let take_profit_pct = env_f64("TAKE_PROFIT_PCT", 0.15).clamp(0.01, 0.95);
-    let stop_loss_pct = env_f64("STOP_LOSS_PCT", 0.10).clamp(0.01, 0.95);
     let max_screens_cfg = env_u64("MAX_SCREENS_PER_CYCLE", 500).clamp(500, 1000) as usize;
     let max_analyses_cfg = env_u64("MAX_ANALYSES_PER_CYCLE", 50)
         .max(1)
         .min(max_screens_cfg as u64) as usize;
     let max_position_rechecks = env_u64("MAX_POSITION_RECHECKS", 8).max(1) as usize;
-    let recheck_min_edge = env_f64("POSITION_RECHECK_MIN_EDGE", 0.02).clamp(-0.2, 0.25);
-    let recheck_stop_edge = env_f64("POSITION_RECHECK_STOP_EDGE", -0.02).clamp(-0.4, 0.1);
-    let min_trade_usdc = env_f64("MIN_TRADE_USDC", 5.0).clamp(1.0, 100.0);
-    let death_balance_usdc = env_f64("DEATH_BALANCE_USDC", 0.01).clamp(0.0, 5.0);
-    let min_balance_for_any_trade = if strategy.max_bet_fraction > 0.0 {
-        min_trade_usdc / strategy.max_bet_fraction
-    } else {
-        f64::INFINITY
-    };
+    let min_trade_usdc = env_f64("MIN_TRADE_USDC", 1.0).clamp(0.5, 100.0);
+    let min_balance_for_any_trade = min_trade_usdc;
 
     println!(
-        "Config: cycle={}s, pos_check={}s, report={}s, TP={:.1}%, SL={:.1}%, screens={}, analyses={}, rechecks={}, min_trade=${:.2}, min_bal_for_trade=${:.2}, death_bal=${:.2}",
+        "Config: cycle={}s, pos_check={}s, report={}s, screens={}, analyses={}, rechecks={}, min_trade=${:.2}, min_bal_for_trade=${:.2}",
         trade_cycle_secs,
         position_check_secs,
         report_interval_secs,
-        take_profit_pct * 100.0,
-        stop_loss_pct * 100.0,
         max_screens_cfg,
         max_analyses_cfg,
         max_position_rechecks,
         min_trade_usdc,
         min_balance_for_any_trade,
-        death_balance_usdc
     );
 
     // Restore cumulative API costs from DB
@@ -200,9 +189,19 @@ async fn main() -> Result<()> {
         realized_profit
     );
 
-    // API seed budget (external funding) is stored separately from dynamic profit-funded credit.
-    // This avoids double-counting profit across restarts.
-    if let Some(seed) = db.get_runtime_f64("api_credit_seed") {
+    // API seed budget: env override takes priority over DB (for manual resets)
+    // API_CREDIT_SEED means "actual remaining credit right now".
+    // Since remaining = seed - db_costs + profit, we must compensate for restored DB costs.
+    if let Some(env_seed) = env_opt_f64("API_CREDIT_SEED") {
+        let actual_remaining = env_seed.max(0.0);
+        let compensated = actual_remaining + prev_api_costs - realized_profit.max(0.0);
+        governor.initial_api_credit = compensated.max(0.0);
+        let _ = db.set_runtime_f64("api_credit_seed", governor.initial_api_credit);
+        println!(
+            "API credit: remaining=${:.4} (seed=${:.4}, db_costs=${:.4})",
+            actual_remaining, governor.initial_api_credit, prev_api_costs
+        );
+    } else if let Some(seed) = db.get_runtime_f64("api_credit_seed") {
         governor.initial_api_credit = seed.max(0.0);
         println!(
             "Restored API seed credit from DB: ${:.4}",
@@ -233,23 +232,24 @@ async fn main() -> Result<()> {
         );
     }
 
-    println!("Fetching initial USDC balance for {:?}...", wallet_address);
+    println!("Fetching initial USDC balance for proxy {:?}...", proxy_address);
     let initial_balance = governor.fetch_real_balance().await.unwrap_or(0.0);
     governor.initial_balance = initial_balance;
     println!("Initial Balance: ${:.2}", initial_balance);
 
+    let scanner = Scanner::new();
+
+    // Send startup message (portfolio report sent after import)
     if let Some(ref n) = notifier {
         let _ = n
             .send_message(&format!(
-                "🚀 *Argo Agent Started*\nWallet: `{:?}`\nBalance: `${:.2}`\nAPI Left: `${:.4}`",
-                wallet_address,
+                "🚀 *Argo Agent Started*\nProxy: `{:?}`\nBalance: `${:.2}`\nAPI Left: `${:.4}`",
+                proxy_address,
                 initial_balance,
-                governor.remaining_api_credit()
+                governor.remaining_api_credit(),
             ))
             .await;
     }
-
-    let scanner = Scanner::new();
     let analyst = match std::env::var("ANTHROPIC_API_KEY") {
         Ok(key) => {
             let model = std::env::var("ANTHROPIC_MODEL").ok();
@@ -265,6 +265,77 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    let mut recharger = match Recharger::new(proxy_address) {
+        Ok(r) => {
+            println!(
+                "⚡ Recharger enabled: threshold=${:.2}, amount=${:.2}, cooldown={}s",
+                r.recharge_threshold, r.recharge_amount, r.cooldown_secs
+            );
+            Some(r)
+        }
+        Err(e) => {
+            println!("⚠️ Recharger init failed: {}. Auto-recharge disabled.", e);
+            None
+        }
+    };
+
+    // Import existing Polymarket positions into DB (so bot can manage them)
+    if let Ok(positions) = scanner.fetch_positions(proxy_address).await {
+        let mut imported = 0;
+        for pos in &positions {
+            if let Some(ref asset) = pos.asset {
+                // Skip closed/redeemable/dead positions
+                if pos.closed.unwrap_or(false) || pos.redeemable.unwrap_or(false) {
+                    continue;
+                }
+                // Only import if not already tracked
+                if !db.has_pending_trade_for_token(asset) {
+                    let avg = pos.avg_price.unwrap_or(0.0);
+                    let inv = pos.initial_value.unwrap_or(0.0);
+                    if avg > 0.0 && inv > 0.0 {
+                        match db.log_trade(
+                            pos.title.as_deref().unwrap_or("Imported position"),
+                            None,
+                            asset,
+                            "BUY",
+                            avg,
+                            inv,
+                            pos.negative_risk.unwrap_or(false),
+                            pos.outcome.as_deref(),
+                            None,
+                            None,
+                            Some("imported_from_polymarket"),
+                            "SUCCESS",
+                        ) {
+                            Ok(_) => imported += 1,
+                            Err(e) => println!("⚠️ Import failed for '{}': {}", pos.title.as_deref().unwrap_or("?"), e),
+                        }
+                    }
+                }
+            }
+        }
+        if imported > 0 {
+            println!("📦 Imported {} existing positions into DB", imported);
+            if let Some(ref n) = notifier {
+                let _ = n
+                    .send_message(&format!("📦 {} 기존 포지션 DB에 임포트 완료", imported))
+                    .await;
+            }
+        }
+    }
+
+    // Send portfolio report as final startup message (most visible in Telegram)
+    if let Some(ref n) = notifier {
+        let report = scanner
+            .build_portfolio_report(
+                proxy_address,
+                initial_balance,
+                governor.remaining_api_credit(),
+            )
+            .await;
+        let _ = n.send_message(&report).await;
+    }
 
     let mut terminal = ratatui::init();
     let mut last_report = std::time::Instant::now();
@@ -297,21 +368,8 @@ async fn main() -> Result<()> {
         let _ = db.set_runtime_f64("realized_profit", governor.realized_profit);
         ui::draw_ui(&mut terminal, &governor.survival_stats())?;
 
-        // Survival mission: balance depleted means immediate death.
-        if governor.current_balance <= death_balance_usdc {
-            let _ = db.set_runtime_f64("api_credit_left", governor.remaining_api_credit());
-            if let Some(ref n) = notifier {
-                let _ = n
-                    .send_message(&format!(
-                        "💀 *AGENT TERMINATED* - Balance depleted.\nBalance: `${:.4}` (threshold `${:.4}`)\nAPI Left: `${:.4}`",
-                        governor.current_balance,
-                        death_balance_usdc,
-                        governor.remaining_api_credit()
-                    ))
-                    .await;
-            }
-            break;
-        }
+        // Low balance: don't die, keep managing positions (they may resolve profitably)
+        // Just skip new trades, but continue checking existing positions
 
         if last_report.elapsed().as_secs() > report_interval_secs {
             if let Some(ref n) = notifier {
@@ -324,25 +382,78 @@ async fn main() -> Result<()> {
                     .await;
                 let _ = n.send_message(&report).await;
             }
+            // Periodic backup alongside the report interval
+            db.backup();
             last_report = std::time::Instant::now();
         }
 
-        // API credit exhausted -> shutdown
-        if governor.remaining_api_credit() <= 0.0 {
-            let _ = db.set_runtime_f64("api_credit_left", 0.0);
-            if let Some(ref n) = notifier {
-                let _ = n
-                    .send_message("💀 *AGENT TERMINATED* - API credit depleted.")
-                    .await;
+        // Auto-recharge: when API credit < $5, send $10 to RedotPay
+        if let Some(ref mut r) = recharger {
+            if r.needs_recharge(governor.remaining_api_credit(), governor.current_balance) {
+                println!(
+                    "⚡ API credit low (${:.4}), starting auto-recharge pipeline...",
+                    governor.remaining_api_credit()
+                );
+                match r.full_recharge_pipeline().await {
+                    Ok((tx_hash, amount_sent)) => {
+                        if let Some(ref n) = notifier {
+                            let _ = n
+                                .send_message(&format!(
+                                    "⚡ *API Recharge - RedotPay 입금 완료*\n\
+                                    API Credit Left: `${:.4}`\n\
+                                    RedotPay 입금: `${:.2}` USDC\n\
+                                    TX: `{}`\n\n\
+                                    👉 *Action Required:*\n\
+                                    1. RedotPay 카드로 anthropic.com API 크레딧 충전\n\
+                                    2. .env에서 API_CREDIT_LEFT 업데이트\n\
+                                    3. 봇이 자동으로 재개됩니다",
+                                    governor.remaining_api_credit(),
+                                    amount_sent,
+                                    tx_hash
+                                ))
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        println!("⚠️ Auto-recharge pipeline failed: {}", e);
+                        if let Some(ref n) = notifier {
+                            let _ = n
+                                .send_message(&format!(
+                                    "⚠️ *Auto-recharge failed:* `{}`",
+                                    e
+                                ))
+                                .await;
+                        }
+                    }
+                }
             }
-            break;
         }
 
-        // Check pending trade outcomes (free - no AI, just HTTP)
+        // API credit exhausted -> DON'T die, wait for auto-recharge
+        // Real credit check happens via API call failures (CREDIT_EXHAUSTED)
+        if governor.remaining_api_credit() <= 0.0 {
+            let _ = db.set_runtime_f64("api_credit_left", 0.0);
+            println!("⚠️ Internal API credit counter depleted. Waiting for auto-reload...");
+            // Don't break - wait and check again. Anthropic auto-reload may have kicked in.
+            sleep(Duration::from_secs(300)).await;
+            // Reset counter optimistically after auto-reload
+            governor.initial_api_credit += 15.0;
+            let _ = db.set_runtime_f64("api_credit_seed", governor.initial_api_credit);
+            if let Some(ref n) = notifier {
+                let _ = n
+                    .send_message("⚡ API credit counter reset (+$15). Checking if auto-reload worked...")
+                    .await;
+            }
+            continue;
+        }
+
+        // Check pending positions: resolve finished markets + AI-driven HOLD/SELL
         let pending_trades = db.get_pending_trades();
+        let total_trades_count = db.debug_trade_counts();
+        println!("DEBUG: {} pending trades (total in DB: {})", pending_trades.len(), total_trades_count);
         if !pending_trades.is_empty() {
             println!(
-                "Checking {} pending trade outcomes...",
+                "Checking {} pending positions...",
                 pending_trades.len()
             );
             let mut positions_by_asset: HashMap<String, crate::scanner::Position> = HashMap::new();
@@ -384,12 +495,12 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Early exit is currently only implemented for BUY entries.
+                // Only manage BUY positions with valid entry price
                 if trade.side != "BUY" || trade.price <= 0.0 {
                     continue;
                 }
 
-                // Use SELL-side quote for realistic exit trigger.
+                // Get current sell price
                 let current_sell_price = match scanner
                     .fetch_token_price_with_side(&trade.token_id, "sell")
                     .await
@@ -402,125 +513,96 @@ async fn main() -> Result<()> {
                 }
 
                 let pnl_pct = (current_sell_price / trade.price) - 1.0;
-                let tp_hit = pnl_pct >= take_profit_pct;
-                let sl_hit = pnl_pct <= -stop_loss_pct;
-
                 let held_label = trade
                     .outcome_label
                     .as_deref()
                     .or_else(|| position.and_then(|p| p.outcome.as_deref()))
                     .unwrap_or("UNKNOWN");
-                let mut live_edge: Option<f64> = None;
-                let mut exit_label: Option<&str> = if tp_hit {
-                    Some("TAKE_PROFIT")
-                } else if sl_hit {
-                    Some("STOP_LOSS")
-                } else {
-                    None
-                };
 
-                // Dynamic thesis re-check: if the estimated edge disappears/reverses, close early.
-                if exit_label.is_none()
-                    && rechecked < max_position_rechecks
-                    && governor.remaining_api_credit() > 0.0
-                {
-                    let price_a_for_screen = if is_no_label(held_label) {
-                        (1.0 - current_sell_price).clamp(0.0, 1.0)
-                    } else {
-                        current_sell_price
-                    };
-                    let recheck_state = build_position_state(
+                // AI-driven position management: ask AI whether to HOLD or SELL
+                if rechecked >= max_position_rechecks || governor.remaining_api_credit() <= 0.0 {
+                    continue;
+                }
+
+                let market_state = build_market_state_for_position(
+                    held_label,
+                    trade.price,
+                    current_sell_price,
+                    pnl_pct,
+                    trade.entry_probability,
+                    trade.entry_edge,
+                );
+
+                match analyst
+                    .analyze_position(
+                        &trade.market_question,
+                        trade.market_description.as_deref(),
                         held_label,
                         trade.price,
                         current_sell_price,
                         pnl_pct,
-                        trade.entry_probability,
-                        trade.entry_edge,
-                        trade.strategy_note.as_deref(),
-                    );
-                    let (_worth_it, prob_a, recheck_cost) = analyst
-                        .quick_screen(
-                            &trade.market_question,
-                            trade.market_description.as_deref(),
-                            price_a_for_screen,
-                            &recheck_state,
-                            governor.current_balance,
-                        )
-                        .await
-                        .unwrap_or((false, 0.5, 0.0));
-                    rechecked += 1;
-                    governor.track_api_cost(recheck_cost);
-                    let _ = db.log_api_cost(recheck_cost, "recheck");
-                    let _ = db.set_runtime_f64("api_credit_left", governor.remaining_api_credit());
+                        &market_state,
+                        governor.current_balance,
+                        governor.remaining_api_credit(),
+                    )
+                    .await
+                {
+                    Ok(decision) => {
+                        rechecked += 1;
+                        governor.track_api_cost(decision.cost_estimate);
+                        let _ = db.log_api_cost(decision.cost_estimate, "position_review");
+                        let _ = db.set_runtime_f64("api_credit_left", governor.remaining_api_credit());
 
-                    if let Some(prob_held) = probability_for_label(prob_a, held_label) {
-                        let edge_now = prob_held - current_sell_price;
-                        live_edge = Some(edge_now);
-
-                        if edge_now <= recheck_stop_edge {
-                            exit_label = Some("THESIS_INVALIDATED");
-                        } else if edge_now <= recheck_min_edge && pnl_pct >= 0.01 {
-                            exit_label = Some("EDGE_REALIZED");
-                        }
-                    } else {
                         println!(
-                            "  ⚠️ Recheck edge skipped (unknown held label `{}`) on `{}`",
-                            held_label, short_q
+                            "  [Position] {} | {} | PnL: {:+.1}% | AI: {} | {}",
+                            short_q, held_label, pnl_pct * 100.0, decision.action, decision.reasoning
                         );
-                    }
-                }
-                let Some(exit_label) = exit_label else {
-                    continue;
-                };
 
-                let token_qty = trade.size / trade.price;
-                let sell_fill_price = (current_sell_price * 0.95).max(0.01);
-                let exit_notional = token_qty * sell_fill_price;
+                        if decision.action == "SELL" {
+                            let token_qty = trade.size / trade.price;
+                            let sell_fill_price = (current_sell_price * 0.95).max(0.01);
+                            let exit_notional = token_qty * sell_fill_price;
 
-                let close_success = if let Some(t) = &trader {
-                    let exit_order = t
-                        .place_market_order(
-                            &trade.token_id,
-                            "SELL",
-                            current_sell_price,
-                            exit_notional,
-                            trade.neg_risk,
-                        )
-                        .await;
+                            let close_success = if let Some(t) = &trader {
+                                let exit_order = t
+                                    .place_market_order(
+                                        &trade.token_id,
+                                        "SELL",
+                                        current_sell_price,
+                                        exit_notional,
+                                        trade.neg_risk,
+                                    )
+                                    .await;
+                                let ok = matches!(&exit_order, Ok(resp) if order_succeeded(resp));
+                                if !ok {
+                                    println!("  ⚠️ AI sell failed on `{}`: {:?}", short_q, exit_order);
+                                }
+                                ok
+                            } else {
+                                false
+                            };
 
-                    let ok = matches!(&exit_order, Ok(resp) if order_succeeded(resp));
-                    if !ok {
-                        println!("  ⚠️ Early exit failed on `{}`: {:?}", short_q, exit_order);
-                        if let Some(ref n) = notifier {
-                            let _ = n.send_message(&format!(
-                                "⚠️ *Early Exit Failed*\n`{}`\nNow: `{:.3}` | Entry: `{:.3}` | PnL: `{:+.1}%`",
-                                short_q, current_sell_price, trade.price, pnl_pct * 100.0
-                            )).await;
+                            if close_success {
+                                let _ = db.resolve_trade(trade.id, "AI_SELL", exit_notional);
+                                let msg = format!(
+                                    "🤖 *AI Position Closed*\n`{}` {} @ `{:.3}` → `{:.3}`\nPnL: `{:+.1}%` | Cash: `${:.2}`\n사유: {}",
+                                    short_q, held_label, trade.price, current_sell_price,
+                                    pnl_pct * 100.0, exit_notional, decision.reasoning
+                                );
+                                println!("{}", msg);
+                                if let Some(ref n) = notifier {
+                                    let _ = n.send_message(&msg).await;
+                                }
+                            }
                         }
                     }
-                    ok
-                } else {
-                    false
-                };
-
-                if close_success {
-                    let _ = db.resolve_trade(trade.id, exit_label, exit_notional);
-                    let edge_info = live_edge
-                        .map(|v| format!("{:+.2}%", v * 100.0))
-                        .unwrap_or_else(|| "N/A".to_string());
-                    let msg = format!(
-                        "🔁 *Trade Closed: {}*\n`{}` BUY @ `{:.3}` → `{:.3}`\nPnL: `{:+.1}%` | Edge(now): `{}` | Cash Out: `${:.2}`",
-                        exit_label,
-                        short_q,
-                        trade.price,
-                        current_sell_price,
-                        pnl_pct * 100.0,
-                        edge_info,
-                        exit_notional
-                    );
-                    println!("{}", msg);
-                    if let Some(ref n) = notifier {
-                        let _ = n.send_message(&msg).await;
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("CREDIT_EXHAUSTED") {
+                            println!("💳 API credit exhausted during position review!");
+                            break;
+                        }
+                        println!("  ⚠️ Position review failed for `{}`: {}", short_q, e);
                     }
                 }
             }
@@ -528,16 +610,6 @@ async fn main() -> Result<()> {
 
         governor.set_realized_profit(db.get_realized_profit());
         let _ = db.set_runtime_f64("realized_profit", governor.realized_profit);
-
-        if governor.remaining_api_credit() <= 0.0 {
-            let _ = db.set_runtime_f64("api_credit_left", 0.0);
-            if let Some(ref n) = notifier {
-                let _ = n
-                    .send_message("💀 *AGENT TERMINATED* - API credit depleted during recheck.")
-                    .await;
-            }
-            break;
-        }
 
         let trade_cycle_due = last_trade_cycle.elapsed().as_secs() >= trade_cycle_secs;
 
@@ -665,7 +737,7 @@ async fn main() -> Result<()> {
                     {
                         Ok(analysis) => {
                             governor.track_api_cost(analysis.cost_estimate);
-                            let _ = db.log_api_cost(analysis.cost_estimate, "analysis");
+                            let _ = db.log_api_cost(analysis.cost_estimate, "opus_analysis");
                             let _ = db.set_runtime_f64(
                                 "api_credit_left",
                                 governor.remaining_api_credit(),
@@ -695,10 +767,10 @@ async fn main() -> Result<()> {
                                 strategy.calculate_kelly_bet(price, analysis.probability);
                             let final_bet_fraction = if kelly_bet > 0.0 && edge >= 0.08 {
                                 // Use max of AI suggestion and half-Kelly
-                                analysis.bet_fraction.max(kelly_bet * 0.5).min(0.06)
+                                analysis.bet_fraction.max(kelly_bet * 0.5).min(strategy.max_bet_fraction)
                             } else if analysis.action != "SKIP" && analysis.bet_fraction > 0.0 {
                                 // AI wants to trade but Kelly disagrees - use AI at reduced size
-                                (analysis.bet_fraction * 0.5).min(0.03)
+                                (analysis.bet_fraction * 0.5).min(0.05)
                             } else {
                                 0.0
                             };
@@ -806,7 +878,7 @@ async fn main() -> Result<()> {
 
                             if let Some(ref n) = notifier {
                                 let _ = n.send_message(&format!(
-                                "🎯 *AI Decision: {}*\nMarket: `{}`\nAI: `{:.1}%` vs Price: `{:.2}`\nBet: `${:.2}` ({:.1}%)\nKelly: {:.1}%\nEntry Edge: `{:+.1}%`\nReason: {}",
+                                "🎯 *AI Decision: {}*\nMarket: `{}`\nAI: `{:.1}%` vs Price: `{:.2}`\nBet: `${:.2}` ({:.1}%)\nKelly: {:.1}%\nEntry Edge: `{:+.1}%`\n사유: {}",
                                 decision_label, market.question, analysis.probability * 100.0, price,
                                 bet_amount_usdc, final_bet_fraction * 100.0, kelly_bet * 100.0, entry_edge * 100.0, analysis.reasoning
                             )).await;
@@ -878,6 +950,33 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
+                            let err_str = e.to_string();
+                            // Detect credit exhaustion → trigger auto recharge
+                            if err_str.contains("CREDIT_EXHAUSTED") {
+                                println!("💳 API credit exhausted! Triggering auto-recharge...");
+                                if let Some(ref mut r) = recharger {
+                                    if r.needs_recharge(0.0, governor.current_balance) {
+                                        match r.full_recharge_pipeline().await {
+                                            Ok((tx_hash, amount)) => {
+                                                if let Some(ref n) = notifier {
+                                                    let _ = n.send_message(&format!(
+                                                        "⚡ *API 크레딧 소진 → 자동 충전!*\nRedotPay 입금: `${:.2}`\nTX: `{}`\n\n5분 후 재시도합니다...",
+                                                        amount, tx_hash
+                                                    )).await;
+                                                }
+                                                // Wait for Anthropic auto-reload
+                                                sleep(Duration::from_secs(300)).await;
+                                                governor.initial_api_credit += 15.0;
+                                                let _ = db.set_runtime_f64("api_credit_seed", governor.initial_api_credit);
+                                            }
+                                            Err(re) => {
+                                                println!("⚠️ Auto-recharge failed: {}", re);
+                                            }
+                                        }
+                                    }
+                                }
+                                break; // break out of market loop, will retry next cycle
+                            }
                             println!("  ❌ Analysis Error: {:?}", e);
                             if let Some(ref n) = notifier {
                                 let _ = n
@@ -890,14 +989,7 @@ async fn main() -> Result<()> {
 
                 if stop_for_api {
                     let _ = db.set_runtime_f64("api_credit_left", 0.0);
-                    if let Some(ref n) = notifier {
-                        let _ = n
-                            .send_message(
-                                "💀 *AGENT TERMINATED* - API credit depleted during cycle.",
-                            )
-                            .await;
-                    }
-                    break;
+                    println!("⚠️ API credit depleted during cycle. Will wait for auto-reload.");
                 }
 
                 println!(
@@ -919,6 +1011,7 @@ async fn main() -> Result<()> {
             }
         }
 
+        db.checkpoint();
         sleep(Duration::from_secs(position_check_secs)).await;
     }
 

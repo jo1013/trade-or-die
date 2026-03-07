@@ -35,8 +35,8 @@ impl Strategy {
             let no_price = 1.0 - market_price;
             let no_prob = 1.0 - p;
             let b = (1.0 / no_price) - 1.0;
-            let q = 1.0 - no_prob;
-            let kelly_f = (no_prob * b - q) / b;
+            let q_no = 1.0 - no_prob;
+            let kelly_f = (no_prob * b - q_no) / b;
             kelly_f.clamp(0.0, self.max_bet_fraction)
         }
     }

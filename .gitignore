@@ -6,3 +6,7 @@ data/
 *.db.wal.bak.*
 .ralph/
 .ralphrc
+
+# Utility scripts with hardcoded wallet addresses
+*.py
+fix_plan.md

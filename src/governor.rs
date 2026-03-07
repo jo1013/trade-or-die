@@ -5,8 +5,12 @@ use std::env;
 use std::sync::Arc;
 use std::time::Instant;
 
-const NATIVE_USDC: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
-const BRIDGED_USDC: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+fn native_usdc() -> String {
+    std::env::var("NATIVE_USDC").unwrap_or_else(|_| "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359".to_string())
+}
+fn bridged_usdc() -> String {
+    std::env::var("BRIDGED_USDC").unwrap_or_else(|_| "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_string())
+}
 
 const DEFAULT_RPC_URLS: &[&str] = &[
     "https://polygon-rpc.com",
@@ -77,8 +81,8 @@ impl Governor {
     /// Check the PROXY wallet's USDC balance (both native + bridged).
     /// Polymarket trades debit/credit the proxy, not the EOA.
     pub async fn fetch_real_balance(&mut self) -> Result<f64> {
-        let native_addr: Address = NATIVE_USDC.parse()?;
-        let bridged_addr: Address = BRIDGED_USDC.parse()?;
+        let native_addr: Address = native_usdc().parse()?;
+        let bridged_addr: Address = bridged_usdc().parse()?;
 
         let total = self.rpc_urls.len();
         for attempt in 0..total {

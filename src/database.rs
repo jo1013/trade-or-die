@@ -1,10 +1,11 @@
 use duckdb::{params, Connection, Result};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Database {
     conn: Connection,
+    db_path: PathBuf,
 }
 
 pub struct PendingTrade {
@@ -82,51 +83,101 @@ fn classify_market(question: &str) -> &'static str {
 impl Database {
     pub fn new() -> Result<Self> {
         let _ = std::fs::create_dir_all("data");
-        let db_path = std::env::var("ARGO_DB_PATH").unwrap_or_else(|_| "data/argo_agent.db".into());
-        let wal_path = format!("{}.wal", db_path);
+        let db_path_str = std::env::var("ARGO_DB_PATH").unwrap_or_else(|_| "data/argo_agent.db".into());
+        let wal_path = format!("{}.wal", db_path_str);
 
-        let conn = match Connection::open(&db_path) {
-            Ok(c) => c,
+        let (conn, final_path) = match Connection::open(&db_path_str) {
+            Ok(c) => (c, PathBuf::from(&db_path_str)),
             Err(open_err) => {
                 let err_msg = open_err.to_string().to_lowercase();
                 if err_msg.contains("permission denied") {
                     let fallback_db_path = std::env::var("ARGO_DB_FALLBACK_PATH")
                         .unwrap_or_else(|_| "data/argo_agent_rw.db".into());
-                    if db_path != fallback_db_path
-                        && Path::new(&db_path).exists()
+                    if db_path_str != fallback_db_path
+                        && Path::new(&db_path_str).exists()
                         && !Path::new(&fallback_db_path).exists()
                     {
-                        let _ = std::fs::copy(&db_path, &fallback_db_path);
+                        let _ = std::fs::copy(&db_path_str, &fallback_db_path);
                     }
                     println!(
                         "⚠️ DB path `{}` is not writable. Falling back to `{}`.",
-                        db_path, fallback_db_path
+                        db_path_str, fallback_db_path
                     );
-                    Connection::open(fallback_db_path)?
+                    let c = Connection::open(&fallback_db_path)?;
+                    (c, PathBuf::from(&fallback_db_path))
                 } else if Path::new(&wal_path).exists() {
+                    // WAL corruption: move it aside and retry
                     let ts = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    let backup_path = format!("{}.bak.{}", wal_path, ts);
-                    if std::fs::rename(&wal_path, &backup_path).is_err() {
+                    let wal_bak = format!("{}.bak.{}", wal_path, ts);
+                    if std::fs::rename(&wal_path, &wal_bak).is_err() {
                         let _ = std::fs::remove_file(&wal_path);
                     }
                     println!(
-                        "⚠️ DuckDB WAL replay failed. Removed corrupt WAL and retrying open at `{}`. Error: {}",
-                        db_path,
+                        "⚠️ DuckDB WAL replay failed. Moved corrupt WAL aside and retrying. Error: {}",
                         open_err
                     );
-                    Connection::open(&db_path)?
+                    match Connection::open(&db_path_str) {
+                        Ok(c) => (c, PathBuf::from(&db_path_str)),
+                        Err(retry_err) => {
+                            // DB file itself may be corrupt; try restoring from backup
+                            println!(
+                                "⚠️ DB still won't open after WAL removal: {}. Attempting backup restore...",
+                                retry_err
+                            );
+                            let backup_path = format!("{}.backup", db_path_str);
+                            if Path::new(&backup_path).exists() {
+                                let corrupt_bak = format!("{}.corrupt.{}", db_path_str, ts);
+                                let _ = std::fs::rename(&db_path_str, &corrupt_bak);
+                                let _ = std::fs::copy(&backup_path, &db_path_str);
+                                println!(
+                                    "⚠️ Restored DB from backup `{}`. Corrupt file saved as `{}`.",
+                                    backup_path, corrupt_bak
+                                );
+                                let c = Connection::open(&db_path_str)?;
+                                (c, PathBuf::from(&db_path_str))
+                            } else {
+                                return Err(retry_err);
+                            }
+                        }
+                    }
                 } else {
-                    return Err(open_err);
+                    // No WAL to blame; check for backup file
+                    let backup_path = format!("{}.backup", db_path_str);
+                    if Path::new(&db_path_str).exists() && Path::new(&backup_path).exists() {
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let corrupt_bak = format!("{}.corrupt.{}", db_path_str, ts);
+                        let _ = std::fs::rename(&db_path_str, &corrupt_bak);
+                        let _ = std::fs::copy(&backup_path, &db_path_str);
+                        println!(
+                            "⚠️ DB file corrupt, restored from backup. Corrupt file: `{}`",
+                            corrupt_bak
+                        );
+                        let c = Connection::open(&db_path_str)?;
+                        (c, PathBuf::from(&db_path_str))
+                    } else {
+                        return Err(open_err);
+                    }
                 }
             }
         };
 
+        // DuckDB requires explicit sequences for auto-increment IDs
+        let _ = conn.execute("CREATE SEQUENCE IF NOT EXISTS analysis_id_seq", []);
+        let _ = conn.execute("CREATE SEQUENCE IF NOT EXISTS trades_id_seq", []);
+        let _ = conn.execute("CREATE SEQUENCE IF NOT EXISTS balance_id_seq", []);
+        let _ = conn.execute("CREATE SEQUENCE IF NOT EXISTS api_costs_id_seq", []);
+        let _ = conn.execute("CREATE SEQUENCE IF NOT EXISTS expert_id_seq", []);
+
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS analysis (
-                id INTEGER PRIMARY KEY,
+                id INTEGER DEFAULT nextval('analysis_id_seq') PRIMARY KEY,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 market_question TEXT,
                 probability DOUBLE,
@@ -138,7 +189,7 @@ impl Database {
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY,
+                id INTEGER DEFAULT nextval('trades_id_seq') PRIMARY KEY,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 market_question TEXT,
                 market_description TEXT,
@@ -158,34 +209,10 @@ impl Database {
             )",
             [],
         )?;
-        let _ = conn.execute(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS neg_risk BOOLEAN DEFAULT FALSE",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS market_description TEXT",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS outcome_label TEXT",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_probability DOUBLE",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_edge DOUBLE",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_note TEXT",
-            [],
-        );
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS balance_history (
-                id INTEGER PRIMARY KEY,
+                id INTEGER DEFAULT nextval('balance_id_seq') PRIMARY KEY,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 balance DOUBLE
             )",
@@ -194,7 +221,7 @@ impl Database {
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS api_costs (
-                id INTEGER PRIMARY KEY,
+                id INTEGER DEFAULT nextval('api_costs_id_seq') PRIMARY KEY,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 cost DOUBLE,
                 source TEXT
@@ -212,7 +239,41 @@ impl Database {
             [],
         )?;
 
-        Ok(Self { conn })
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS expert_opinions (
+                id INTEGER DEFAULT nextval('expert_id_seq') PRIMARY KEY,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                market_question TEXT,
+                expert_type TEXT,
+                probability DOUBLE,
+                confidence DOUBLE,
+                reasoning TEXT,
+                leader_probability DOUBLE,
+                leader_action TEXT
+            )",
+            [],
+        )?;
+
+        Ok(Self { conn, db_path: final_path })
+    }
+
+    /// Force WAL checkpoint to flush pending writes to the main DB file.
+    /// Reduces WAL size and corruption risk on unexpected shutdown.
+    pub fn checkpoint(&self) {
+        if let Err(e) = self.conn.execute("CHECKPOINT", []) {
+            println!("⚠️ DB checkpoint failed: {}", e);
+        }
+    }
+
+    /// Create a backup copy of the DB file for crash recovery.
+    /// Runs a CHECKPOINT first to ensure the backup is consistent.
+    pub fn backup(&self) {
+        self.checkpoint();
+        let backup_path = format!("{}.backup", self.db_path.display());
+        match std::fs::copy(&self.db_path, &backup_path) {
+            Ok(_) => println!("DEBUG: DB backup created at `{}`", backup_path),
+            Err(e) => println!("⚠️ DB backup failed: {}", e),
+        }
     }
 
     pub fn log_analysis(&self, question: &str, prob: f64, reason: &str, cost: f64) -> Result<()> {
@@ -220,6 +281,31 @@ impl Database {
             "INSERT INTO analysis (market_question, probability, reasoning, cost) VALUES (?, ?, ?, ?)",
             params![question, prob, reason, cost],
         )?;
+        Ok(())
+    }
+
+    pub fn log_expert_opinions(
+        &self,
+        question: &str,
+        experts: &[crate::analyst::ExpertOpinion],
+        leader_probability: f64,
+        leader_action: &str,
+    ) -> Result<()> {
+        for expert in experts {
+            self.conn.execute(
+                "INSERT INTO expert_opinions (market_question, expert_type, probability, confidence, reasoning, leader_probability, leader_action)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    question,
+                    expert.expert_type,
+                    expert.probability,
+                    expert.confidence,
+                    expert.reasoning,
+                    leader_probability,
+                    leader_action
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -449,6 +535,26 @@ impl Database {
             api_spent,
             pos_lines.join("\n")
         )
+    }
+
+    pub fn debug_trade_counts(&self) -> String {
+        let mut info = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare(
+            "SELECT status, outcome, COUNT(*) FROM trades GROUP BY status, outcome"
+        ) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, i64>(2).unwrap_or(0),
+                ))
+            }) {
+                for row in rows.flatten() {
+                    info.push(format!("{}:{} x{}", row.0, row.1, row.2));
+                }
+            }
+        }
+        if info.is_empty() { "empty".to_string() } else { info.join(", ") }
     }
 
     pub fn log_balance(&self, balance: f64) -> Result<()> {

@@ -3,6 +3,7 @@ use ethers::prelude::Address;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 fn de_opt_f64_any<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
 where
@@ -137,9 +138,64 @@ pub struct Scanner {
 
 impl Scanner {
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { client }
+    }
+
+    /// GET request with retry + exponential backoff for transient errors
+    async fn get_with_retry(&self, url: &str) -> Result<reqwest::Response> {
+        let max_retries = 2u32;
+        let mut last_err = None;
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let backoff_ms = 300 * 2u64.pow(attempt - 1);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+
+            match self.client.get(url).send().await {
+                Ok(resp) => {
+                    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || resp.status().is_server_error()
+                    {
+                        last_err = Some(anyhow::anyhow!(
+                            "HTTP {} from {}",
+                            resp.status(),
+                            url
+                        ));
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let kind = if e.is_timeout() {
+                        "timeout"
+                    } else if e.is_connect() {
+                        "connection"
+                    } else {
+                        "request"
+                    };
+                    println!(
+                        "⚠️ Scanner {} error (attempt {}/{}): {} | url: {}",
+                        kind,
+                        attempt + 1,
+                        max_retries + 1,
+                        e,
+                        url
+                    );
+                    last_err = Some(anyhow::anyhow!("Scanner {} error: {}", kind, e));
+                    continue;
+                }
+            }
         }
+
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("GET failed after {} retries: {}", max_retries, url)))
     }
 
     /// 500~1000개 시장을 페이지네이션으로 스캔한 뒤,
@@ -148,6 +204,7 @@ impl Scanner {
         let mut all_markets: Vec<Market> = Vec::new();
         let mut offset = 0;
         let limit = 50;
+        let mut consecutive_failures = 0u32;
 
         // Use events endpoint and flatten event.markets (Polymarket docs recommendation).
         loop {
@@ -156,9 +213,31 @@ impl Scanner {
                 limit, offset
             );
 
-            let batch: Vec<Event> = match self.client.get(&url).send().await {
-                Ok(resp) => resp.json().await.unwrap_or_default(),
-                Err(_) => break,
+            let batch: Vec<Event> = match self.get_with_retry(&url).await {
+                Ok(resp) => {
+                    match resp.json().await {
+                        Ok(v) => {
+                            consecutive_failures = 0;
+                            v
+                        }
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            println!("⚠️ Market JSON parse failed at offset {} (fail {}/3): {}", offset, consecutive_failures, e);
+                            if consecutive_failures >= 3 {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    println!("⚠️ Market fetch failed (fail {}/3): {}", consecutive_failures, e);
+                    if consecutive_failures >= 3 {
+                        break;
+                    }
+                    continue;
+                }
             };
 
             let batch_len = batch.len();
@@ -278,8 +357,14 @@ impl Scanner {
             "https://data-api.polymarket.com/positions?user={:?}",
             proxy_address
         );
-        let resp = self.client.get(&url).send().await?;
-        let positions: Vec<Position> = resp.json().await.unwrap_or_default();
+        let resp = self.get_with_retry(&url).await?;
+        let positions: Vec<Position> = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                println!("⚠️ Positions JSON parse failed: {}", e);
+                Vec::new()
+            }
+        };
         Ok(positions)
     }
 
@@ -298,6 +383,23 @@ impl Scanner {
         if positions.is_empty() {
             return format!(
                 "📊 *Argo Agent - Portfolio Report*\n\nNo open positions.\nUSDC: `${:.2}` | API Left: `${:.4}`",
+                usdc_balance, api_left
+            );
+        }
+
+        // Filter out dead positions (current_value == 0 and cur_price == 0)
+        let positions: Vec<_> = positions
+            .into_iter()
+            .filter(|p| {
+                let cv = p.current_value.unwrap_or(0.0);
+                let cp = p.cur_price.unwrap_or(0.0);
+                cv > 0.0 || cp > 0.0
+            })
+            .collect();
+
+        if positions.is_empty() {
+            return format!(
+                "📊 *Argo Agent - Portfolio Report*\n\nNo active positions.\nUSDC: `${:.2}` | API Left: `${:.4}`",
                 usdc_balance, api_left
             );
         }
@@ -395,12 +497,26 @@ impl Scanner {
             token_id, side
         );
 
-        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let resp = self.get_with_retry(&url).await?;
+        let body = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                println!("⚠️ Scanner: failed to read price response body: {}", e);
+                return Ok(None);
+            }
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("⚠️ Scanner: failed to parse price JSON: {} | body: {}", e, &body[..body.len().min(200)]);
+                return Ok(None);
+            }
+        };
 
-        let price = resp["price"]
+        let price = parsed["price"]
             .as_str()
             .and_then(|p| p.parse::<f64>().ok())
-            .or_else(|| resp["price"].as_f64());
+            .or_else(|| parsed["price"].as_f64());
 
         Ok(price)
     }

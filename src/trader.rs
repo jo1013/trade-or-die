@@ -9,12 +9,16 @@ use serde::Deserialize;
 use sha2::Sha256;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
-const NEG_RISK_CTF_EXCHANGE: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+fn ctf_exchange() -> String {
+    std::env::var("CTF_EXCHANGE").unwrap_or_else(|_| "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".to_string())
+}
+fn neg_risk_ctf_exchange() -> String {
+    std::env::var("NEG_RISK_CTF_EXCHANGE").unwrap_or_else(|_| "0xC5d563A36AE78145C45a50134d48A1215220f80a".to_string())
+}
 static ORDER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub struct Trader {
@@ -134,8 +138,15 @@ impl Trader {
         let signer = private_key.parse::<LocalWallet>()?.with_chain_id(137u64);
         let proxy_address: Address = proxy_addr_str.parse()?;
 
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         Ok(Self {
-            client: Client::new(),
+            client,
             api_key,
             api_secret,
             api_passphrase,
@@ -226,9 +237,9 @@ impl Trader {
         };
 
         let exchange_address: Address = if neg_risk {
-            NEG_RISK_CTF_EXCHANGE.parse()?
+            neg_risk_ctf_exchange().parse()?
         } else {
-            CTF_EXCHANGE.parse()?
+            ctf_exchange().parse()?
         };
 
         let signer_addr_cs = ethers::utils::to_checksum(&self.signer.address(), None);
@@ -278,32 +289,119 @@ impl Trader {
         println!("DEBUG Order: {} {} @ {:.4} (fill_price={:.4}) | amount=${:.2} | maker={} taker={} | neg_risk={}",
             side_string, token_id_str, price, fill_price, amount_usdc, maker_amount, taker_amount, neg_risk);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("POLY_ADDRESS", &signer_addr_cs)
-            .header("POLY_SIGNATURE", &auth_sig)
-            .header("POLY_TIMESTAMP", timestamp.to_string())
-            .header("POLY_API_KEY", &self.api_key)
-            .header("POLY_PASSPHRASE", &self.api_passphrase)
-            .header("Content-Type", "application/json")
-            .body(body_str)
-            .send()
-            .await?;
+        // Retry transient HTTP failures with exponential backoff
+        let max_retries = 2u32;
+        let mut last_err = None;
 
-        let status = response.status();
-        let text = response.text().await?;
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let backoff_ms = 500 * 2u64.pow(attempt - 1);
+                println!(
+                    "  ⏳ Order retry {}/{} after {}ms...",
+                    attempt, max_retries, backoff_ms
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
 
-        if status.is_success() {
-            println!("Order Response: {}", text);
-            Ok(serde_json::from_str(&text)?)
-        } else {
-            println!("Order API Error ({}): {}", status, text);
-            Ok(OrderResponse {
-                order_id: None,
-                status: Some("FAILED".to_string()),
-                error: Some(text),
-            })
+            let response = match self
+                .client
+                .post(&url)
+                .header("POLY_ADDRESS", &signer_addr_cs)
+                .header("POLY_SIGNATURE", &auth_sig)
+                .header("POLY_TIMESTAMP", timestamp.to_string())
+                .header("POLY_API_KEY", &self.api_key)
+                .header("POLY_PASSPHRASE", &self.api_passphrase)
+                .header("Content-Type", "application/json")
+                .body(body_str.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let kind = if e.is_timeout() {
+                        "timeout"
+                    } else if e.is_connect() {
+                        "connection"
+                    } else {
+                        "network"
+                    };
+                    println!(
+                        "  ⚠️ Order {} error (attempt {}/{}): {} | {} {} @ {:.4} ${:.2}",
+                        kind, attempt + 1, max_retries + 1, e,
+                        side_string, token_id_str, price, amount_usdc
+                    );
+                    last_err = Some(anyhow::anyhow!("Order {} error: {}", kind, e));
+                    continue;
+                }
+            };
+
+            let status = response.status();
+
+            // Retry on server errors (5xx) or rate limiting (429)
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                let text = response.text().await.unwrap_or_default();
+                let truncated = &text[..text.len().min(200)];
+                println!(
+                    "  ⚠️ Order API transient error (attempt {}/{}): HTTP {} | {} {} @ {:.4} ${:.2} | {}",
+                    attempt + 1, max_retries + 1, status,
+                    side_string, token_id_str, price, amount_usdc, truncated
+                );
+                last_err = Some(anyhow::anyhow!("Order API Error ({}): {}", status, text));
+                continue;
+            }
+
+            let text = match response.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    println!(
+                        "  ⚠️ Order response body read failed: {} | {} {} @ {:.4} ${:.2}",
+                        e, side_string, token_id_str, price, amount_usdc
+                    );
+                    last_err = Some(anyhow::anyhow!("Order response body error: {}", e));
+                    continue;
+                }
+            };
+
+            if status.is_success() {
+                println!("Order Response: {}", text);
+                match serde_json::from_str::<OrderResponse>(&text) {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => {
+                        println!(
+                            "  ⚠️ Order response JSON parse failed: {} | body: {}",
+                            e, &text[..text.len().min(300)]
+                        );
+                        return Ok(OrderResponse {
+                            order_id: None,
+                            status: Some("PARSE_ERROR".to_string()),
+                            error: Some(format!("Response parse error: {} | raw: {}", e, &text[..text.len().min(200)])),
+                        });
+                    }
+                }
+            } else {
+                // Non-retryable client error - return immediately with detailed context
+                println!(
+                    "  ❌ Order rejected: HTTP {} | {} {} @ {:.4} ${:.2} neg_risk={} | {}",
+                    status, side_string, token_id_str, price, amount_usdc, neg_risk,
+                    &text[..text.len().min(300)]
+                );
+                return Ok(OrderResponse {
+                    order_id: None,
+                    status: Some("FAILED".to_string()),
+                    error: Some(format!("HTTP {}: {}", status, text)),
+                });
+            }
         }
+
+        // All retries exhausted - log final failure summary
+        let err_detail = last_err.as_ref().map(|e| e.to_string()).unwrap_or_default();
+        println!(
+            "  ❌ Order FAILED after {} retries: {} {} @ {:.4} ${:.2} neg_risk={} | {}",
+            max_retries + 1, side_string, token_id_str, price, amount_usdc, neg_risk, err_detail
+        );
+
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("Order failed after {} retries", max_retries)
+        }))
     }
 }

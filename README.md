@@ -1,7 +1,7 @@
 # Argo Agent - AI Survival Trading Bot
 
 > [@mirae_code](https://www.instagram.com/mirae_code)의 "AI에게 50달러를 맡겼다 48시간 뒤 벌어진일" 영상을 보고 따라 만들었습니다.
-> 수익률은... 글쎄? 하지만 AI가 스스로 시장을 분석하고, 판단하고, 거래하고, 살아남으려 한다는 건 확실하다.
+> Claude Code로 바이브코딩하여 개발. 수익률은... 글쎄? 하지만 AI가 스스로 시장을 분석하고, 판단하고, 거래하고, 살아남으려 한다는 건 확실하다.
 
 Polymarket 예측시장에서 **스스로 생존하는 AI 트레이딩 에이전트**.
 Claude AI가 시장을 분석하고, Kelly Criterion으로 사이즈를 계산하고, 자동으로 매매한다.
