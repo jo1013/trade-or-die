@@ -1,0 +1,11 @@
+services:
+  argo-agent:
+    build: .
+    container_name: argo-rust-agent
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    stdin_open: true # For ratatui TUI
+    tty: true        # For ratatui TUI
+    restart: unless-stopped

@@ -1,0 +1,8 @@
+/target
+.env
+data/
+*.db
+*.db.wal
+*.db.wal.bak.*
+.ralph/
+.ralphrc
