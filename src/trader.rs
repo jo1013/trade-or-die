@@ -10,6 +10,7 @@ use sha2::Sha256;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug, info, warn, error};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -206,11 +207,11 @@ impl Trader {
         };
         let side_string = if side == 0 { "BUY" } else { "SELL" };
 
-        // FOK market order: allow 5% slippage
+        // FOK market order: BUY 5% slippage, SELL 15% slippage (low-liquidity tokens need wider spread)
         let fill_price = if side == 0 {
             (price * 1.05).min(0.99)
         } else {
-            (price * 0.95).max(0.01)
+            (price * 0.85).max(0.01)
         };
 
         // Polymarket precision: amounts must be truncated to whole numbers (no extra decimals)
@@ -226,7 +227,9 @@ impl Trader {
             (U256::from(ma), U256::from(ta))
         } else {
             // SELL: makerAmount = tokens to send, takerAmount = USDC to receive
-            let token_amount = amount_usdc / fill_price;
+            // amount_usdc for SELL = token_qty * price (notional at current price)
+            // Derive actual token count from notional / price (NOT fill_price, to avoid inflating qty)
+            let token_amount = amount_usdc / price;
             let ma_raw = (token_amount * 1_000_000.0) as u128;
             // maker: 2 decimal accuracy = 10000 granularity
             let ma = (ma_raw / 10000) * 10000;
@@ -286,8 +289,7 @@ impl Trader {
         let body_str = body_json.to_string();
         let auth_sig = self.generate_auth_signature(timestamp, "POST", endpoint, &body_str)?;
 
-        println!("DEBUG Order: {} {} @ {:.4} (fill_price={:.4}) | amount=${:.2} | maker={} taker={} | neg_risk={}",
-            side_string, token_id_str, price, fill_price, amount_usdc, maker_amount, taker_amount, neg_risk);
+        debug!(side = side_string, token = token_id_str, price = format_args!("{:.4}", price), fill_price = format_args!("{:.4}", fill_price), amount = format_args!("${:.2}", amount_usdc), maker = %maker_amount, taker = %taker_amount, neg_risk, "Placing order");
 
         // Retry transient HTTP failures with exponential backoff
         let max_retries = 2u32;
@@ -296,10 +298,7 @@ impl Trader {
         for attempt in 0..=max_retries {
             if attempt > 0 {
                 let backoff_ms = 500 * 2u64.pow(attempt - 1);
-                println!(
-                    "  ⏳ Order retry {}/{} after {}ms...",
-                    attempt, max_retries, backoff_ms
-                );
+                debug!(attempt, max_retries, backoff_ms, "Order retry");
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
 
@@ -325,11 +324,7 @@ impl Trader {
                     } else {
                         "network"
                     };
-                    println!(
-                        "  ⚠️ Order {} error (attempt {}/{}): {} | {} {} @ {:.4} ${:.2}",
-                        kind, attempt + 1, max_retries + 1, e,
-                        side_string, token_id_str, price, amount_usdc
-                    );
+                    warn!(kind, attempt = attempt + 1, max = max_retries + 1, err = %e, side = side_string, token = token_id_str, "Order network error");
                     last_err = Some(anyhow::anyhow!("Order {} error: {}", kind, e));
                     continue;
                 }
@@ -341,11 +336,7 @@ impl Trader {
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                 let text = response.text().await.unwrap_or_default();
                 let truncated = &text[..text.len().min(200)];
-                println!(
-                    "  ⚠️ Order API transient error (attempt {}/{}): HTTP {} | {} {} @ {:.4} ${:.2} | {}",
-                    attempt + 1, max_retries + 1, status,
-                    side_string, token_id_str, price, amount_usdc, truncated
-                );
+                warn!(attempt = attempt + 1, max = max_retries + 1, status = %status, side = side_string, token = token_id_str, body = truncated, "Order API transient error");
                 last_err = Some(anyhow::anyhow!("Order API Error ({}): {}", status, text));
                 continue;
             }
@@ -353,24 +344,18 @@ impl Trader {
             let text = match response.text().await {
                 Ok(t) => t,
                 Err(e) => {
-                    println!(
-                        "  ⚠️ Order response body read failed: {} | {} {} @ {:.4} ${:.2}",
-                        e, side_string, token_id_str, price, amount_usdc
-                    );
+                    warn!(err = %e, side = side_string, token = token_id_str, "Order response body read failed");
                     last_err = Some(anyhow::anyhow!("Order response body error: {}", e));
                     continue;
                 }
             };
 
             if status.is_success() {
-                println!("Order Response: {}", text);
+                info!(response = %text, "Order response");
                 match serde_json::from_str::<OrderResponse>(&text) {
                     Ok(resp) => return Ok(resp),
                     Err(e) => {
-                        println!(
-                            "  ⚠️ Order response JSON parse failed: {} | body: {}",
-                            e, &text[..text.len().min(300)]
-                        );
+                        warn!(err = %e, body = &text[..text.len().min(300)], "Order response JSON parse failed");
                         return Ok(OrderResponse {
                             order_id: None,
                             status: Some("PARSE_ERROR".to_string()),
@@ -380,11 +365,7 @@ impl Trader {
                 }
             } else {
                 // Non-retryable client error - return immediately with detailed context
-                println!(
-                    "  ❌ Order rejected: HTTP {} | {} {} @ {:.4} ${:.2} neg_risk={} | {}",
-                    status, side_string, token_id_str, price, amount_usdc, neg_risk,
-                    &text[..text.len().min(300)]
-                );
+                error!(status = %status, side = side_string, token = token_id_str, price = format_args!("{:.4}", price), amount = format_args!("${:.2}", amount_usdc), neg_risk, body = &text[..text.len().min(300)], "Order rejected");
                 return Ok(OrderResponse {
                     order_id: None,
                     status: Some("FAILED".to_string()),
@@ -395,10 +376,7 @@ impl Trader {
 
         // All retries exhausted - log final failure summary
         let err_detail = last_err.as_ref().map(|e| e.to_string()).unwrap_or_default();
-        println!(
-            "  ❌ Order FAILED after {} retries: {} {} @ {:.4} ${:.2} neg_risk={} | {}",
-            max_retries + 1, side_string, token_id_str, price, amount_usdc, neg_risk, err_detail
-        );
+        error!(retries = max_retries + 1, side = side_string, token = token_id_str, price = format_args!("{:.4}", price), amount = format_args!("${:.2}", amount_usdc), neg_risk, detail = %err_detail, "Order FAILED after all retries");
 
         Err(last_err.unwrap_or_else(|| {
             anyhow::anyhow!("Order failed after {} retries", max_retries)

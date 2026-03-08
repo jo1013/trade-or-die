@@ -2,6 +2,7 @@ use duckdb::{params, Connection, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, warn};
 
 pub struct Database {
     conn: Connection,
@@ -99,10 +100,7 @@ impl Database {
                     {
                         let _ = std::fs::copy(&db_path_str, &fallback_db_path);
                     }
-                    println!(
-                        "⚠️ DB path `{}` is not writable. Falling back to `{}`.",
-                        db_path_str, fallback_db_path
-                    );
+                    warn!(path = %db_path_str, fallback = %fallback_db_path, "DB path not writable, falling back");
                     let c = Connection::open(&fallback_db_path)?;
                     (c, PathBuf::from(&fallback_db_path))
                 } else if Path::new(&wal_path).exists() {
@@ -115,27 +113,18 @@ impl Database {
                     if std::fs::rename(&wal_path, &wal_bak).is_err() {
                         let _ = std::fs::remove_file(&wal_path);
                     }
-                    println!(
-                        "⚠️ DuckDB WAL replay failed. Moved corrupt WAL aside and retrying. Error: {}",
-                        open_err
-                    );
+                    warn!(err = %open_err, "DuckDB WAL replay failed. Moved corrupt WAL aside, retrying");
                     match Connection::open(&db_path_str) {
                         Ok(c) => (c, PathBuf::from(&db_path_str)),
                         Err(retry_err) => {
                             // DB file itself may be corrupt; try restoring from backup
-                            println!(
-                                "⚠️ DB still won't open after WAL removal: {}. Attempting backup restore...",
-                                retry_err
-                            );
+                            warn!(err = %retry_err, "DB still won't open after WAL removal. Attempting backup restore");
                             let backup_path = format!("{}.backup", db_path_str);
                             if Path::new(&backup_path).exists() {
                                 let corrupt_bak = format!("{}.corrupt.{}", db_path_str, ts);
                                 let _ = std::fs::rename(&db_path_str, &corrupt_bak);
                                 let _ = std::fs::copy(&backup_path, &db_path_str);
-                                println!(
-                                    "⚠️ Restored DB from backup `{}`. Corrupt file saved as `{}`.",
-                                    backup_path, corrupt_bak
-                                );
+                                warn!(backup = %backup_path, corrupt = %corrupt_bak, "Restored DB from backup");
                                 let c = Connection::open(&db_path_str)?;
                                 (c, PathBuf::from(&db_path_str))
                             } else {
@@ -154,10 +143,7 @@ impl Database {
                         let corrupt_bak = format!("{}.corrupt.{}", db_path_str, ts);
                         let _ = std::fs::rename(&db_path_str, &corrupt_bak);
                         let _ = std::fs::copy(&backup_path, &db_path_str);
-                        println!(
-                            "⚠️ DB file corrupt, restored from backup. Corrupt file: `{}`",
-                            corrupt_bak
-                        );
+                        warn!(corrupt = %corrupt_bak, "DB file corrupt, restored from backup");
                         let c = Connection::open(&db_path_str)?;
                         (c, PathBuf::from(&db_path_str))
                     } else {
@@ -261,7 +247,7 @@ impl Database {
     /// Reduces WAL size and corruption risk on unexpected shutdown.
     pub fn checkpoint(&self) {
         if let Err(e) = self.conn.execute("CHECKPOINT", []) {
-            println!("⚠️ DB checkpoint failed: {}", e);
+            warn!(err = %e, "DB checkpoint failed");
         }
     }
 
@@ -271,8 +257,8 @@ impl Database {
         self.checkpoint();
         let backup_path = format!("{}.backup", self.db_path.display());
         match std::fs::copy(&self.db_path, &backup_path) {
-            Ok(_) => println!("DEBUG: DB backup created at `{}`", backup_path),
-            Err(e) => println!("⚠️ DB backup failed: {}", e),
+            Ok(_) => debug!(path = %backup_path, "DB backup created"),
+            Err(e) => warn!(err = %e, "DB backup failed"),
         }
     }
 
@@ -353,6 +339,16 @@ impl Database {
                 "SELECT COUNT(*) FROM trades WHERE token_id = ? AND status = 'SUCCESS' AND outcome = 'PENDING'",
             )
             .and_then(|mut s| s.query_row(params![token_id], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false)
+    }
+
+    pub fn has_pending_trade_for_question(&self, question: &str) -> bool {
+        self.conn
+            .prepare(
+                "SELECT COUNT(*) FROM trades WHERE market_question = ? AND status = 'SUCCESS' AND outcome = 'PENDING'",
+            )
+            .and_then(|mut s| s.query_row(params![question], |row| row.get::<_, i64>(0)))
             .map(|count| count > 0)
             .unwrap_or(false)
     }
@@ -563,6 +559,19 @@ impl Database {
             params![balance],
         )?;
         Ok(())
+    }
+
+    /// Check if a market was analyzed within the given time window (seconds).
+    pub fn has_recent_analysis(&self, question: &str, max_age_secs: u64) -> bool {
+        self.conn
+            .prepare(
+                "SELECT COUNT(*) FROM analysis
+                 WHERE market_question = ?
+                   AND epoch(CURRENT_TIMESTAMP) - epoch(timestamp) < ?",
+            )
+            .and_then(|mut s| s.query_row(params![question, max_age_secs as f64], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false)
     }
 
     /// Compact learning summary for AI prompt

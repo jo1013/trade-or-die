@@ -1,6 +1,7 @@
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AnalysisResponse {
@@ -72,6 +73,7 @@ pub struct Analyst {
     model: String,
     screen_model: String,
     expert_model: String,
+    review_model: String,
 }
 
 fn extract_json(text: &str) -> Option<String> {
@@ -99,8 +101,10 @@ impl Analyst {
             .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
         let expert = std::env::var("ANTHROPIC_EXPERT_MODEL")
             .unwrap_or_else(|_| "claude-opus-4-6".to_string());
+        let review = std::env::var("ANTHROPIC_REVIEW_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
 
-        println!("AI Models: screen={}, expert={}, leader={}", screen, expert, main_model);
+        info!(screen = %screen, expert = %expert, review = %review, leader = %main_model, "AI models configured");
 
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -115,6 +119,7 @@ impl Analyst {
             model: main_model,
             screen_model: screen,
             expert_model: expert,
+            review_model: review,
         }
     }
 
@@ -125,6 +130,7 @@ impl Analyst {
             model: "mock".to_string(),
             screen_model: "mock".to_string(),
             expert_model: "mock".to_string(),
+            review_model: "mock".to_string(),
         }
     }
 
@@ -164,7 +170,7 @@ impl Analyst {
         {
             Ok(r) => r,
             Err(e) => {
-                println!("  ⚠️ Screen API error: {}", e);
+                warn!(err = %e, "Screen API error");
                 return Ok((false, 0.5, 0.0));
             }
         };
@@ -250,10 +256,7 @@ Output ONLY valid JSON. Reasoning in Korean, under 60 chars:
         let json_string = match extract_json(&response.text) {
             Some(s) => s,
             None => {
-                println!(
-                    "  ⚠️ No JSON found in AI response: {}",
-                    &response.text[..response.text.len().min(200)]
-                );
+                warn!(raw = &response.text[..response.text.len().min(200)], "No JSON found in AI response");
                 return Ok(AnalysisResponse {
                     action: "SKIP".to_string(),
                     probability: 0.5,
@@ -268,11 +271,7 @@ Output ONLY valid JSON. Reasoning in Korean, under 60 chars:
         let parsed: serde_json::Value = match serde_json::from_str(json_str) {
             Ok(v) => v,
             Err(e) => {
-                println!(
-                    "  ⚠️ JSON parse error: {} | raw: {}",
-                    e,
-                    &json_str[..json_str.len().min(200)]
-                );
+                warn!(err = %e, raw = &json_str[..json_str.len().min(200)], "JSON parse error in analysis");
                 return Ok(AnalysisResponse {
                     action: "SKIP".to_string(),
                     probability: 0.5,
@@ -354,13 +353,13 @@ or
         );
 
         let response = self
-            .call_api(&self.model, &system, &user_msg, 256)
+            .call_api(&self.review_model, &system, &user_msg, 256)
             .await?;
 
         let json_str = match extract_json(&response.text) {
             Some(s) => s,
             None => {
-                println!("  ⚠️ Position review raw (no JSON found): {}", &response.text[..response.text.len().min(200)]);
+                warn!(raw = &response.text[..response.text.len().min(200)], "Position review: no JSON found, inferring action");
                 // Try to infer action from text
                 let text_lower = response.text.to_lowercase();
                 let action = if text_lower.contains("sell") && !text_lower.contains("hold") {
@@ -380,7 +379,7 @@ or
         let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
             Ok(v) => v,
             Err(e) => {
-                println!("  ⚠️ Position review JSON error: {} | raw: {}", e, &json_str[..json_str.len().min(200)]);
+                warn!(err = %e, raw = &json_str[..json_str.len().min(200)], "Position review JSON parse error");
                 return Ok(PositionDecision {
                     action: "HOLD".to_string(),
                     reasoning: format!("JSON parse error: {}", e),
@@ -473,14 +472,11 @@ or
                 Ok(resp) => {
                     total_cost += resp.cost;
                     let opinion = Self::parse_expert_response(name, &resp.text);
-                    println!(
-                        "  [{}] prob={:.2} conf={:.2} | {}",
-                        opinion.expert_type, opinion.probability, opinion.confidence, opinion.reasoning
-                    );
+                    debug!(expert = %opinion.expert_type, prob = format_args!("{:.2}", opinion.probability), conf = format_args!("{:.2}", opinion.confidence), reason = %opinion.reasoning, "Expert opinion");
                     experts.push(opinion);
                 }
                 Err(e) => {
-                    println!("  [{}] FAILED: {}", name, e);
+                    warn!(expert = name, err = %e, "Expert API call failed");
                     // Use neutral opinion on failure
                     experts.push(ExpertOpinion {
                         expert_type: name.to_string(),
@@ -561,10 +557,7 @@ Output ONLY valid JSON, nothing else:
             }
             None => {
                 // Fallback: use confidence-weighted average of experts
-                println!(
-                    "  ⚠️ Leader parse failed, using expert consensus. Raw: {}",
-                    &leader_response.text[..leader_response.text.len().min(120)]
-                );
+                warn!(raw = &leader_response.text[..leader_response.text.len().min(120)], "Leader parse failed, using expert consensus");
                 let valid_experts: Vec<&ExpertOpinion> =
                     experts.iter().filter(|e| e.confidence > 0.0).collect();
                 if valid_experts.is_empty() {
@@ -675,10 +668,7 @@ Output ONLY valid JSON, nothing else:
         for attempt in 0..=max_retries {
             if attempt > 0 {
                 let backoff_ms = 500 * 2u64.pow(attempt - 1); // 500ms, 1s, 2s
-                println!(
-                    "  ⏳ API retry {}/{} after {}ms...",
-                    attempt, max_retries, backoff_ms
-                );
+                debug!(attempt, max_retries, backoff_ms, "API retry");
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
 
@@ -720,7 +710,7 @@ Output ONLY valid JSON, nothing else:
 
             // Retry on transient HTTP errors (429 rate limit, 5xx server errors)
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                println!("  ⚠️ API transient error ({}), will retry", status);
+                warn!(status = %status, "API transient error, will retry");
                 last_err = Some(anyhow::anyhow!(
                     "API Error ({}): {}",
                     status,
@@ -793,7 +783,8 @@ Output ONLY valid JSON, nothing else:
             } else if model.contains("sonnet") {
                 (3.0, 15.0)
             } else {
-                (0.25, 1.25)
+                // Haiku 4.5: $1.00 input, $5.00 output per MTok
+                (1.0, 5.0)
             };
 
             let cost = (usage.input_tokens as f64 * input_rate / 1_000_000.0)

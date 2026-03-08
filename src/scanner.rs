@@ -4,6 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::time::Duration;
+use tracing::{debug, warn};
 
 fn de_opt_f64_any<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
 where
@@ -180,14 +181,7 @@ impl Scanner {
                     } else {
                         "request"
                     };
-                    println!(
-                        "⚠️ Scanner {} error (attempt {}/{}): {} | url: {}",
-                        kind,
-                        attempt + 1,
-                        max_retries + 1,
-                        e,
-                        url
-                    );
+                    warn!(kind, attempt = attempt + 1, max = max_retries + 1, err = %e, url, "Scanner request error");
                     last_err = Some(anyhow::anyhow!("Scanner {} error: {}", kind, e));
                     continue;
                 }
@@ -222,7 +216,7 @@ impl Scanner {
                         }
                         Err(e) => {
                             consecutive_failures += 1;
-                            println!("⚠️ Market JSON parse failed at offset {} (fail {}/3): {}", offset, consecutive_failures, e);
+                            warn!(offset, fail = consecutive_failures, err = %e, "Market JSON parse failed");
                             if consecutive_failures >= 3 {
                                 break;
                             }
@@ -232,7 +226,7 @@ impl Scanner {
                 }
                 Err(e) => {
                     consecutive_failures += 1;
-                    println!("⚠️ Market fetch failed (fail {}/3): {}", consecutive_failures, e);
+                    warn!(fail = consecutive_failures, err = %e, "Market fetch failed");
                     if consecutive_failures >= 3 {
                         break;
                     }
@@ -253,10 +247,7 @@ impl Scanner {
             offset += limit;
         }
 
-        println!(
-            "DEBUG: Fetched {} total markets from Gamma events API.",
-            all_markets.len()
-        );
+        debug!(count = all_markets.len(), "Fetched markets from Gamma events API");
 
         let mut result = Vec::new();
 
@@ -344,10 +335,7 @@ impl Scanner {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        println!(
-            "DEBUG: {} tradable markets passed filters (active/orderbook/price).",
-            result.len()
-        );
+        debug!(count = result.len(), "Tradable markets passed filters");
         Ok(result)
     }
 
@@ -361,7 +349,7 @@ impl Scanner {
         let positions: Vec<Position> = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                println!("⚠️ Positions JSON parse failed: {}", e);
+                warn!(err = %e, "Positions JSON parse failed");
                 Vec::new()
             }
         };
@@ -501,14 +489,14 @@ impl Scanner {
         let body = match resp.text().await {
             Ok(t) => t,
             Err(e) => {
-                println!("⚠️ Scanner: failed to read price response body: {}", e);
+                warn!(err = %e, "Failed to read price response body");
                 return Ok(None);
             }
         };
         let parsed: serde_json::Value = match serde_json::from_str(&body) {
             Ok(v) => v,
             Err(e) => {
-                println!("⚠️ Scanner: failed to parse price JSON: {} | body: {}", e, &body[..body.len().min(200)]);
+                warn!(err = %e, body = &body[..body.len().min(200)], "Failed to parse price JSON");
                 return Ok(None);
             }
         };

@@ -4,6 +4,7 @@ use ethers::prelude::*;
 use ethers::utils::keccak256;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{info, warn};
 
 fn bridged_usdc_addr() -> String {
     std::env::var("BRIDGED_USDC").unwrap_or_else(|_| "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_string())
@@ -108,14 +109,14 @@ impl Recharger {
 
         let pending = client.send_transaction(tx, None).await?;
         let tx_hash = pending.tx_hash();
-        println!("    {} TX: 0x{:x}", label, tx_hash);
+        info!(step = label, tx = format_args!("0x{:x}", tx_hash), "TX submitted");
 
         let receipt = pending
             .await?
             .ok_or_else(|| anyhow::anyhow!("No receipt for {}", label))?;
 
         if receipt.status == Some(U64::from(1)) {
-            println!("    {} SUCCESS!", label);
+            info!(step = label, "TX succeeded");
             Ok(receipt)
         } else {
             Err(anyhow::anyhow!("{} reverted", label))
@@ -182,7 +183,7 @@ impl Recharger {
 
         if receipt.status == Some(U64::from(1)) {
             let hash_str = format!("0x{:x}", tx_hash);
-            println!("    Proxy→EOA: {} SUCCESS!", hash_str);
+            info!(tx = %hash_str, "Proxy→EOA withdrawal succeeded");
             Ok(hash_str)
         } else {
             Err(anyhow::anyhow!("GnosisSafe execTransaction reverted"))
@@ -253,7 +254,7 @@ impl Recharger {
             {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    println!("    Fee {} failed: {}", fee, e);
+                    warn!(fee, err = %e, "Swap fee tier failed");
                     if fee == 500 {
                         return Err(anyhow::anyhow!("All swap fee tiers failed"));
                     }
@@ -313,35 +314,29 @@ impl Recharger {
         let withdraw_raw =
             U256::from(((self.recharge_amount + 0.5) * 1_000_000.0) as u128);
 
-        println!(
-            "⚡ Recharger: Starting pipeline (${:.2} + $0.50 buffer)...",
-            self.recharge_amount
-        );
+        info!(amount = format_args!("${:.2}", self.recharge_amount), "Recharger: Starting pipeline (+$0.50 buffer)");
 
         // Step 1
-        println!("  [1/4] Withdraw USDC.e from Proxy → EOA");
+        info!("[1/4] Withdraw USDC.e from Proxy → EOA");
         self.withdraw_to_eoa(&client, withdraw_raw).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Step 2
-        println!("  [2/4] Approve Uniswap Router");
+        info!("[2/4] Approve Uniswap Router");
         self.approve_router(&client, withdraw_raw).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Step 3
-        println!("  [3/4] Swap USDC.e → Native USDC");
+        info!("[3/4] Swap USDC.e → Native USDC");
         self.swap_to_native_usdc(&client, withdraw_raw).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Step 4
-        println!("  [4/4] Send Native USDC → RedotPay");
+        info!("[4/4] Send Native USDC → RedotPay");
         let (tx_hash, amount_sent) = self.send_to_redotpay(&client).await?;
 
         self.last_attempt = Some(std::time::Instant::now());
-        println!(
-            "💰 Recharger: Done! ${:.2} USDC → RedotPay | TX: {}",
-            amount_sent, tx_hash
-        );
+        info!(amount = format_args!("${:.2}", amount_sent), tx = %tx_hash, "Recharger: pipeline complete");
         Ok((tx_hash, amount_sent))
     }
 }

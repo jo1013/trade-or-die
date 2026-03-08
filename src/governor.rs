@@ -4,6 +4,7 @@ use ethers::utils::format_units;
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::warn;
 
 fn native_usdc() -> String {
     std::env::var("NATIVE_USDC").unwrap_or_else(|_| "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359".to_string())
@@ -114,7 +115,7 @@ impl Governor {
                     return Ok(balance_f64);
                 }
                 _ => {
-                    println!("⚠️ RPC failed: {} (trying next...)", rpc_url);
+                    warn!(rpc = %rpc_url, "RPC failed, trying next");
                     continue;
                 }
             }
@@ -137,6 +138,11 @@ impl Governor {
 
     pub fn remaining_api_credit(&self) -> f64 {
         (self.initial_api_credit + self.api_credit_from_profit() - self.api_costs).max(0.0)
+    }
+
+    /// API가 실제로 CREDIT_EXHAUSTED 에러를 반환했을 때 내부 카운터를 강제로 0으로 맞춤
+    pub fn force_api_credit_zero(&mut self) {
+        self.api_costs = self.initial_api_credit + self.api_credit_from_profit();
     }
 
     pub fn survival_stats(&self) -> String {
