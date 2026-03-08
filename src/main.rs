@@ -205,7 +205,8 @@ async fn main() -> Result<()> {
     let mut governor = Governor::new(0.0, wallet_address, proxy_address);
     let notifier = Notifier::new();
     let max_bet_frac = env_f64("MAX_BET_FRACTION", 0.10).clamp(0.02, 0.25);
-    let strategy = Strategy::new(0.10, max_bet_frac); // min_edge 10%, max_bet 8%
+    let kelly_frac = env_f64("KELLY_FRACTION", 0.5).clamp(0.1, 1.0);
+    let strategy = Strategy::new(0.10, max_bet_frac).with_kelly_fraction(kelly_frac);
     let trade_cycle_secs = env_u64("TRADE_CYCLE_SECONDS", 1800).max(30);
     let position_check_secs = env_u64("POSITION_CHECK_SECONDS", 60).max(10);
     let report_interval_secs = env_u64("REPORT_INTERVAL_SECONDS", 14400).max(300);
@@ -227,6 +228,8 @@ async fn main() -> Result<()> {
         rechecks = max_position_rechecks,
         min_trade = format_args!("${:.2}", min_trade_usdc),
         min_bal = format_args!("${:.2}", min_balance_for_any_trade),
+        kelly = format_args!("{:.0}%", kelly_frac * 100.0),
+        max_bet = format_args!("{:.0}%", max_bet_frac * 100.0),
         "Config loaded"
     );
 
@@ -994,8 +997,7 @@ async fn main() -> Result<()> {
                             let kelly_bet =
                                 strategy.calculate_kelly_bet(price, adjusted_prob);
                             let final_bet_fraction = if kelly_bet > 0.0 && edge >= 0.10 {
-                                // Pure Half-Kelly only — ignore AI bet_fraction (overconfident)
-                                (kelly_bet * 0.5).min(strategy.max_bet_fraction)
+                                kelly_bet // Already scaled by kelly_fraction (default half-Kelly)
                             } else {
                                 0.0 // Kelly says no → skip
                             };
