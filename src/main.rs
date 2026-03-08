@@ -140,6 +140,25 @@ fn classify_market_category(question: &str) -> &'static str {
     }
 }
 
+/// Dynamic edge thresholds per category.
+/// Sports: outcome more predictable from stats → lower threshold (8%).
+/// Crypto/Commodities: volatile, price-driven → moderate (10%).
+/// Politics/Finance: narrative-driven, harder to price → higher (12%).
+/// Other: default (10%).
+/// Returns (screen_min_edge, trade_min_edge).
+/// screen_min_edge: used during Haiku screening (lower = more markets pass to analysis).
+/// trade_min_edge: used post-analysis for the final trade decision (higher = stricter).
+fn category_edge_thresholds(category: &str) -> (f64, f64) {
+    match category {
+        "Sports"      => (0.06, 0.08),
+        "Crypto"      => (0.08, 0.10),
+        "Politics"    => (0.10, 0.12),
+        "Finance"     => (0.10, 0.12),
+        "Commodities" => (0.08, 0.10),
+        _             => (0.08, 0.10), // "Other"
+    }
+}
+
 fn build_market_state(market: &crate::scanner::CleanMarket) -> String {
     let end = market.end_date.as_deref().unwrap_or("NA");
     format!(
@@ -879,14 +898,18 @@ async fn main() -> Result<()> {
                     };
                     let market_state = build_market_state(market);
 
+                    // Dynamic edge threshold based on market category
+                    let category = classify_market_category(&market.question);
+                    let (screen_min_edge, trade_min_edge) = category_edge_thresholds(category);
+
                     // Stage 1: Quick screen with Haiku (cheap) — with cache
                     let (worth_it, screen_cost) = if let Some((cached_prob, cached_time)) = screen_cache.get(&market.question) {
                         if cached_time.elapsed().as_secs() < screen_cache_ttl_secs {
-                            // Cache hit: check if previous screening found edge
+                            // Cache hit: check if previous screening found edge (category-aware)
                             let cached_edge = (cached_prob - price).abs();
-                            if cached_edge < 0.08 {
+                            if cached_edge < screen_min_edge {
                                 // No edge last time → skip entirely (no API cost)
-                                debug!(screen = screened_count, max = max_screens, market = %market.question, "Screen skip: cached, no edge");
+                                debug!(screen = screened_count, max = max_screens, market = %market.question, cat = category, min_edge = format_args!("{:.0}%", screen_min_edge * 100.0), "Screen skip: cached, no edge");
                                 continue;
                             }
                             // Had edge before → pass through to analysis (no API cost)
@@ -901,6 +924,7 @@ async fn main() -> Result<()> {
                                     price,
                                     &market_state,
                                     governor.current_balance,
+                                    screen_min_edge,
                                 )
                                 .await
                                 .unwrap_or((false, 0.5, 0.0));
@@ -920,6 +944,7 @@ async fn main() -> Result<()> {
                                 price,
                                 &market_state,
                                 governor.current_balance,
+                                screen_min_edge,
                             )
                             .await
                             .unwrap_or((false, 0.5, 0.0));
@@ -961,6 +986,7 @@ async fn main() -> Result<()> {
                             governor.current_balance,
                             governor.remaining_api_credit(),
                             &learning,
+                            trade_min_edge,
                         )
                         .await
                     {
@@ -986,7 +1012,8 @@ async fn main() -> Result<()> {
                             let shrink_factor = 0.6;
                             let adjusted_prob = price + (analysis.probability - price) * shrink_factor;
                             let edge = (adjusted_prob - price).abs();
-                            let math_action = if edge < 0.10 {
+                            // Dynamic edge threshold: category-specific trade_min_edge
+                            let math_action = if edge < trade_min_edge {
                                 "SKIP"
                             } else if adjusted_prob > price {
                                 "BUY"
@@ -995,8 +1022,8 @@ async fn main() -> Result<()> {
                             };
 
                             let kelly_bet =
-                                strategy.calculate_kelly_bet(price, adjusted_prob);
-                            let final_bet_fraction = if kelly_bet > 0.0 && edge >= 0.10 {
+                                strategy.calculate_kelly_bet_with_edge(price, adjusted_prob, trade_min_edge);
+                            let final_bet_fraction = if kelly_bet > 0.0 && edge >= trade_min_edge {
                                 kelly_bet // Already scaled by kelly_fraction (default half-Kelly)
                             } else {
                                 0.0 // Kelly says no → skip
@@ -1004,7 +1031,7 @@ async fn main() -> Result<()> {
 
                             let final_action = math_action;
 
-                            info!(action = final_action, ai_said = %analysis.action, ai_prob = format_args!("{:.1}%", analysis.probability * 100.0), adj_prob = format_args!("{:.1}%", adjusted_prob * 100.0), price = format_args!("{:.2}", price), edge = format_args!("{:.1}%", edge * 100.0), bet = format_args!("{:.1}%", final_bet_fraction * 100.0), kelly = format_args!("{:.1}%", kelly_bet * 100.0), cost = format_args!("${:.4}", analysis.cost_estimate), "Analysis result");
+                            info!(action = final_action, ai_said = %analysis.action, ai_prob = format_args!("{:.1}%", analysis.probability * 100.0), adj_prob = format_args!("{:.1}%", adjusted_prob * 100.0), price = format_args!("{:.2}", price), edge = format_args!("{:.1}%", edge * 100.0), min_edge = format_args!("{:.0}%", trade_min_edge * 100.0), cat = category, bet = format_args!("{:.1}%", final_bet_fraction * 100.0), kelly = format_args!("{:.1}%", kelly_bet * 100.0), cost = format_args!("${:.4}", analysis.cost_estimate), "Analysis result");
 
                             if final_action == "SKIP" || final_bet_fraction <= 0.0 {
                                 continue;

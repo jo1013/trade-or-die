@@ -135,6 +135,7 @@ impl Analyst {
     }
 
     /// Fast screening with Haiku - returns (should_analyze, probability_estimate, cost)
+    /// `min_edge`: category-specific edge threshold (e.g. 0.06 for sports, 0.10 for politics)
     pub async fn quick_screen(
         &self,
         question: &str,
@@ -142,6 +143,7 @@ impl Analyst {
         market_price: f64,
         market_state: &str,
         live_balance: f64,
+        min_edge: f64,
     ) -> Result<(bool, f64, f64)> {
         if self.api_key == "mock" {
             return Ok((false, 0.5, 0.0));
@@ -154,13 +156,14 @@ impl Analyst {
 
         // 한국어 해설:
         // "고정 시작금액 대신 현재 실시간 잔고를 넣어 생존 제약을 주고 q만 추정하게 한다."
+        // 멀티팩터: 볼륨/유동성/마감일을 스크리닝에도 반영
         let system = format!(
-            "NON-NEGOTIABLE SURVIVAL: live balance is ${:.2}. If balance reaches $0, you are terminated immediately. Survival is mandatory. Estimate true probability q of Outcome A using current public developments up to {} and live market state. Output ONLY JSON {{\"probability\":0.0-1.0}}.",
+            "NON-NEGOTIABLE SURVIVAL: live balance is ${:.2}. If balance reaches $0, you are terminated immediately. Survival is mandatory. Estimate true probability q of Outcome A using current public developments up to {} and live market state. Consider market factors: high volume = more informed pricing, low liquidity = higher slippage risk, near-expiry markets need higher confidence. Output ONLY JSON {{\"probability\":0.0-1.0}}.",
             live_balance, today
         );
 
         let user_msg = format!(
-            "Q:{}\nCtx:{}\nState:{}\nPriceA:{:.4}\nJSON only.",
+            "Q:{}\nCtx:{}\nMarket:{}\nPriceA:{:.4}\nJSON only.",
             question, desc_short, state_short, market_price
         );
 
@@ -185,11 +188,12 @@ impl Analyst {
         };
 
         let edge = (prob - market_price).abs();
-        let worth_analyzing = edge >= 0.08;
+        let worth_analyzing = edge >= min_edge;
 
         Ok((worth_analyzing, prob, response.cost))
     }
 
+    /// `min_edge`: category-specific edge threshold passed to the AI prompt
     pub async fn analyze_market(
         &self,
         question: &str,
@@ -199,6 +203,7 @@ impl Analyst {
         balance: f64,
         api_remaining: f64,
         learning_context: &str,
+        min_edge: f64,
     ) -> Result<AnalysisResponse> {
         if self.api_key == "mock" {
             return Ok(AnalysisResponse {
@@ -216,6 +221,7 @@ impl Analyst {
 
         // 한국어 해설:
         // "현재 실시간 잔고 기반 생존 제약(0되면 종료)을 강하게 넣고 edge/사이징을 계산하게 한다."
+        // 멀티팩터: State 필드에 v24/vol/liq/chg24%/end 포함 → 프롬프트에서 명시적 활용
         let system_prompt = format!(
             r#"You are an autonomous Polymarket trader. Date: {today}.
 NON-NEGOTIABLE SURVIVAL MISSION: Live balance is ${balance:.2}. If balance hits $0, mission fails and you are terminated.
@@ -228,14 +234,21 @@ Definitions:
 - Outcome A price = p.
 - Outcome B price = 1-p.
 
+Market factors (in State field):
+- v24: 24h volume in USD. High volume (>$50k) = informed pricing, harder to find edge. Low volume (<$5k) = thin market, more mispricing but also slippage risk.
+- liq: current liquidity. Below $5k = high slippage, reduce bet_fraction.
+- chg24%: 24h price change. Large moves (>10%) may indicate news event — verify thesis.
+- end: market expiry date. Near-expiry (<48h) needs high confidence. Far-expiry (>30d) = more uncertainty.
+
 Rules:
 1) Estimate q = true probability of Outcome A.
-2) edge=|q-p|. If edge<0.08 => SKIP.
+2) edge=|q-p|. If edge<{min_edge:.2} => SKIP. (threshold varies by market category)
 3) q>p => BUY(A). q<p => SELL (buy B).
 4) bet_fraction range [0,0.10]:
-   0.08-0.15 -> 0.01-0.03
+   {min_edge:.2}-0.15 -> 0.01-0.03
    0.15-0.25 -> 0.03-0.06
    >0.25 -> 0.06-0.10
+   If liquidity < $5k, halve the bet_fraction.
 5) If uncertainty is high or thesis is weak, return SKIP.
 
 Output ONLY valid JSON. Reasoning in Korean, under 60 chars:
@@ -245,7 +258,7 @@ Output ONLY valid JSON. Reasoning in Korean, under 60 chars:
         let desc_str = description.unwrap_or("No additional context");
         let desc_short: String = desc_str.chars().take(220).collect();
         let user_message = format!(
-            "Q:{}\nDesc:{}\nState:{}\nPriceA:{:.4}\nJSON only.",
+            "Q:{}\nDesc:{}\nMarket:{}\nPriceA:{:.4}\nJSON only.",
             question, desc_short, state_short, market_price
         );
 
@@ -339,6 +352,7 @@ Consider:
 - PnL trajectory and risk (think dynamically, not fixed TP/SL)
 - If PnL is very negative and thesis is dead, cut losses
 - If PnL is positive but thesis is weakening, take profit
+- Market state includes entry_q (entry probability) and entry_edge — compare to current price
 
 Output ONLY valid JSON. Reasoning in Korean, under 80 chars:
 {{"action":"HOLD","reasoning":"논거 유효"}}
@@ -431,25 +445,25 @@ or
         let state_short: String = market_state.chars().take(220).collect();
 
         let user_msg = format!(
-            "Q:{}\nDesc:{}\nState:{}\nPriceA:{:.4}\nJSON only.",
+            "Q:{}\nDesc:{}\nMarket:{}\nPriceA:{:.4}\nJSON only.",
             question, desc_short, state_short, market_price
         );
 
-        // Expert prompts - survival-aware, JSON-strict
+        // Expert prompts - survival-aware, JSON-strict, multi-factor aware
         let survival_note = "You are an AI whose survival depends on profitable trades. Your API costs are funded by trading profits. Bad analysis = no profit = you die.";
 
         let fundamentals_system = format!(
-            "{} You are a fundamentals analyst. Today: {}. Estimate the TRUE probability of Outcome A using news, domain knowledge, historical base rates. Output ONLY valid JSON, nothing else.\nExample: {{\"probability\":0.65,\"confidence\":0.80,\"reasoning\":\"historical base rate suggests higher\"}}",
+            "{} You are a fundamentals analyst. Today: {}. Estimate the TRUE probability of Outcome A using news, domain knowledge, historical base rates. The Market field contains v24 (24h volume), liq (liquidity), chg24% (24h price change), end (expiry date) — factor these into your confidence level. Output ONLY valid JSON, nothing else.\nExample: {{\"probability\":0.65,\"confidence\":0.80,\"reasoning\":\"historical base rate suggests higher\"}}",
             survival_note, today
         );
 
         let contrarian_system = format!(
-            "{} You are a contrarian analyst. Today: {}. Market price={:.4}. Your job: find why the market is WRONG. Look for overreaction, neglected risks, or mispricing. Output ONLY valid JSON, nothing else.\nExample: {{\"probability\":0.40,\"confidence\":0.60,\"reasoning\":\"market overreacts to recent news\"}}",
+            "{} You are a contrarian analyst. Today: {}. Market price={:.4}. Your job: find why the market is WRONG. Look for overreaction, neglected risks, or mispricing. Check if large 24h price changes (chg24%) created overcorrection. Output ONLY valid JSON, nothing else.\nExample: {{\"probability\":0.40,\"confidence\":0.60,\"reasoning\":\"market overreacts to recent news\"}}",
             survival_note, today, market_price
         );
 
         let quant_system = format!(
-            "{} You are a quant analyst. Today: {}. Analyze volume, liquidity, price momentum, time to expiry. Output ONLY valid JSON, nothing else.\nExample: {{\"probability\":0.55,\"confidence\":0.70,\"reasoning\":\"low volume suggests uncertainty\"}}",
+            "{} You are a quant analyst. Today: {}. Market data is in the Market field: v24=24h volume USD, vol=total volume, liq=liquidity depth, chg24%=24h price change, end=expiry date. Analyze: (1) Volume profile: high v24 vs low = informed vs thin market. (2) Liquidity: below $5k = slippage risk, lower confidence. (3) Momentum: large chg24% = potential mean reversion or news-driven trend. (4) Time to expiry: near-expiry (<48h) = high certainty needed, far-expiry (>30d) = more uncertainty. Output ONLY valid JSON, nothing else.\nExample: {{\"probability\":0.55,\"confidence\":0.70,\"reasoning\":\"low volume, thin liquidity, possible mispricing\"}}",
             survival_note, today
         );
 
@@ -515,6 +529,7 @@ Decision rules:
 2) edge = |q - price|. If edge < 0.08, action must be SKIP
 3) q > price => BUY. q < price => SELL
 4) bet_fraction: consensus(spread<0.08) = 0.04-0.10, mixed = 0.02-0.05, divergent(>0.15) = SKIP
+   Reduce bet_fraction if quant expert flags low liquidity or thin volume.
 5) All experts confidence < 0.4 => SKIP
 
 Output ONLY valid JSON, nothing else:
